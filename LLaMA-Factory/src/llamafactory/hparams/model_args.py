@@ -143,9 +143,14 @@ class BaseModelArguments:
         default="offload",
         metadata={"help": "Path to offload model weights."},
     )
-    use_cache: bool = field(
+    use_kv_cache: bool = field(
         default=True,
-        metadata={"help": "Whether or not to use KV cache in generation."},
+        metadata={
+            "help": (
+                "Whether or not to use KV cache in generation. "
+                "Renamed from use_cache to avoid clashing with transformers.TrainingArguments.use_cache."
+            )
+        },
     )
     infer_dtype: Literal["auto", "float16", "bfloat16", "float32"] = field(
         default="auto",

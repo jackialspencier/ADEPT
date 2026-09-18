@@ -25,6 +25,7 @@ Use modelscope: USE_MODELSCOPE_HUB=1
 Use openmind: USE_OPENMIND_HUB=1
 """
 
+from .extras import hf_compat as _hf_compat  # noqa: F401  # transformers>=5 shims
 from .extras.env import VERSION
 
 

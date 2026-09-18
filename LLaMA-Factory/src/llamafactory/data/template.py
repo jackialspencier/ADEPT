@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import re
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from typing_extensions import override
 
@@ -199,8 +200,15 @@ class Template:
             logger.info_rank0(f"Add pad token: {tokenizer.pad_token}")
 
         if stop_words:
+            # transformers>=5 renamed replace_additional_special_tokens → replace_extra_special_tokens
+            add_kwargs: dict[str, Any] = {}
+            add_params = inspect.signature(tokenizer.add_special_tokens).parameters
+            if "replace_extra_special_tokens" in add_params:
+                add_kwargs["replace_extra_special_tokens"] = False
+            elif "replace_additional_special_tokens" in add_params:
+                add_kwargs["replace_additional_special_tokens"] = False
             num_added_tokens = tokenizer.add_special_tokens(
-                dict(additional_special_tokens=stop_words), replace_additional_special_tokens=False
+                dict(additional_special_tokens=stop_words), **add_kwargs
             )
             logger.info_rank0("Add {} to stop words.".format(",".join(stop_words)))
             if num_added_tokens > 0:

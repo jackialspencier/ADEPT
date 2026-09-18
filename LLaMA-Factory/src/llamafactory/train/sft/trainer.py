@@ -28,7 +28,7 @@ from typing_extensions import override
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from ...extras.packages import is_transformers_version_greater_than
-from ..callbacks import SaveProcessorCallback
+from ..callbacks import SaveProcessorCallback, ParameterImportanceCallback
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
 
 
@@ -71,6 +71,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         if processor is not None:
             self.add_callback(SaveProcessorCallback(processor))
+
+        import os
+        adept_eval = os.environ.get("ADEPT_EVAL_DATA_PATH")
+        if not adept_eval:
+            _root = os.environ.get("REPO_ROOT")
+            if _root:
+                _cand = os.path.join(_root, "shared/data/adept_general_competence.json")
+                if os.path.isfile(_cand):
+                    adept_eval = _cand
+        if adept_eval:
+            tok = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
+            self.add_callback(ParameterImportanceCallback(
+                eval_steps=int(os.environ.get("ADEPT_IMPORTANCE_EVAL_STEPS", "500")),
+                batch_size=int(os.environ.get("ADEPT_IMPORTANCE_BATCH_SIZE", "2")),
+                eval_data_path=adept_eval,
+                tokenizer=tok,
+                model=self.model,
+                trainer=self,
+            ))
 
         if finetuning_args.use_badam:
             from badam import BAdamCallback, clip_grad_norm_old_version  # type: ignore

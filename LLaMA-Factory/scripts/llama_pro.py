@@ -53,6 +53,21 @@ def block_expansion(
     if num_layers % num_expand != 0:
         raise ValueError(f"`num_layers` {num_layers} should be divisible by `num_expand` {num_expand}.")
 
+    split = num_layers // num_expand
+    old_layer_types = list(getattr(config, "layer_types", None) or [])
+    if old_layer_types:
+        # Keep Gemma2 `layer_types` aligned with inserted blocks (transformers>=5 validates this).
+        if len(old_layer_types) != num_layers:
+            raise ValueError(
+                f"config.layer_types length ({len(old_layer_types)}) != num_hidden_layers ({num_layers})"
+            )
+        new_layer_types: list[str] = []
+        for i in range(num_layers):
+            new_layer_types.append(old_layer_types[i])
+            if (i + 1) % split == 0:
+                new_layer_types.append(old_layer_types[i])
+        setattr(config, "layer_types", new_layer_types)
+
     setattr(config, "num_hidden_layers", num_layers + num_expand)
     config.save_pretrained(output_dir)
 
@@ -67,7 +82,6 @@ def block_expansion(
     if save_safetensors and getattr(model.config, "tie_word_embeddings", False):
         del model.lm_head  # safetensors does not allow shared weights
 
-    split = num_layers // num_expand
     layer_cnt = 0
     state_dict = model.state_dict()
     output_state_dict: dict[str, torch.Tensor] = OrderedDict()

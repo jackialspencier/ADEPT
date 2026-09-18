@@ -9,26 +9,54 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+from pathlib import Path
 import copy
 
-def setup_distributed():
-    """Initialize distributed training environment."""
-    num_gpus = torch.cuda.device_count()
-    
-    if 'WORLD_SIZE' not in os.environ:
-        os.environ['WORLD_SIZE'] = str(num_gpus)
-    if 'RANK' not in os.environ:
-        os.environ['RANK'] = '0'
-    if 'LOCAL_RANK' not in os.environ:
-        os.environ['LOCAL_RANK'] = '0'
+def _distributed_requested() -> bool:
+    """True only when launched via torchrun/accelerate (env rendezvous present)."""
+    if dist.is_available() and dist.is_initialized():
+        return True
+    # torchrun sets LOCAL_RANK and MASTER_ADDR; plain `python` should stay single-process.
+    if os.environ.get("MASTER_ADDR") and int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        return True
+    if os.environ.get("RANK") is not None and int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        return True
+    return False
 
-    local_rank = int(os.environ['LOCAL_RANK'])
+
+def get_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def setup_distributed():
+    """Init NCCL only for multi-process launches; plain `python` stays single-GPU."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for calc_importance.py")
+
+    num_gpus = torch.cuda.device_count()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if _distributed_requested():
+        if "WORLD_SIZE" not in os.environ:
+            os.environ["WORLD_SIZE"] = str(num_gpus)
+        if "RANK" not in os.environ:
+            os.environ["RANK"] = "0"
+        if "LOCAL_RANK" not in os.environ:
+            os.environ["LOCAL_RANK"] = "0"
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        return local_rank, dist.get_world_size()
+
+    # Single-process path (recommended for nohup + CUDA_VISIBLE_DEVICES=0)
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("LOCAL_RANK", "0")
     torch.cuda.set_device(local_rank)
-    
-    if not dist.is_initialized():
-        dist.init_process_group(backend='nccl')
-    
-    return local_rank, num_gpus
+    return local_rank, 1
 
 class SimpleDataset(Dataset):
     def __init__(self, data, tokenizer, max_length=2048):
@@ -85,15 +113,25 @@ class SimpleDataset(Dataset):
                 }
 
 def create_dataloader(dataset, batch_size, local_rank):
-    sampler = DistributedSampler(dataset, shuffle=False)
+    if dist.is_available() and dist.is_initialized():
+        sampler = DistributedSampler(dataset, shuffle=False)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=4,
+            pin_memory=True,
+        )
+        return dataloader, sampler
+
     dataloader = DataLoader(
-        dataset, 
-        batch_size=batch_size, 
-        sampler=sampler,
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
         num_workers=4,
-        pin_memory=True
+        pin_memory=True,
     )
-    return dataloader, sampler
+    return dataloader, None
 
 def gradient_importance_analysis(model, dataloader, device):
     importance = {}
@@ -104,7 +142,7 @@ def gradient_importance_analysis(model, dataloader, device):
     model.train()
     sample_counts = {"pt": 0, "sft": 0}
     
-    for batch in tqdm(dataloader, desc="Computing gradient importance", disable=not dist.get_rank() == 0):
+    for batch in tqdm(dataloader, desc="Computing gradient importance", disable=(get_rank() != 0)):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
@@ -130,20 +168,20 @@ def gradient_importance_analysis(model, dataloader, device):
             sample_counts["sft"] += 1
 
         # Periodically clear GPU memory
-        if dist.get_rank() == 0 and sample_counts["pt"] % 100 == 0:
+        if get_rank() == 0 and sample_counts["pt"] % 100 == 0:
             torch.cuda.empty_cache()
     
-    # Synchronize results across all processes
-    for name in importance:
-        tensor = torch.tensor([importance[name]], device=device)
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        importance[name] = tensor.item()
-    
-    # Synchronize sample counts
-    for key in sample_counts:
-        count_tensor = torch.tensor([sample_counts[key]], device=device)
-        dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
-        sample_counts[key] = count_tensor.item()
+    # Synchronize results across all processes (no-op in single-process mode)
+    if dist.is_available() and dist.is_initialized():
+        for name in importance:
+            tensor = torch.tensor([importance[name]], device=device)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            importance[name] = tensor.item()
+
+        for key in sample_counts:
+            count_tensor = torch.tensor([sample_counts[key]], device=device)
+            dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+            sample_counts[key] = count_tensor.item()
     
     total_samples = sample_counts["pt"] + sample_counts["sft"]
     if total_samples > 0:
@@ -336,7 +374,7 @@ class PruningImportanceAnalyzer:
         with torch.no_grad():
             for batch in tqdm(self.dataloader, 
                             desc="Computing loss",
-                            disable=not dist.get_rank() == 0):
+                            disable=(get_rank() != 0)):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
@@ -368,14 +406,14 @@ class PruningImportanceAnalyzer:
     def compute_importance(self):
         self.original_state = copy.deepcopy(self.model.state_dict())
         
-        if dist.get_rank() == 0:
+        if get_rank() == 0:
             print("Computing base loss on full dataset...")
         self.base_loss = self._compute_loss()
         
         importance_scores = {}
         layer_mapping = {}
         
-        if dist.get_rank() == 0:
+        if get_rank() == 0:
             print("Analyzing layers...")
         
         for name, module in self.model.named_modules():
@@ -389,7 +427,7 @@ class PruningImportanceAnalyzer:
 
         for layer_num in tqdm(sorted(layer_mapping.keys()), 
                             desc="Evaluating layers",
-                            disable=not dist.get_rank() == 0):
+                            disable=(get_rank() != 0)):
             layer_modules = layer_mapping[layer_num]
             
             saved_states = {}
@@ -408,7 +446,7 @@ class PruningImportanceAnalyzer:
             if dist.is_initialized():
                 dist.barrier()
             
-            if dist.get_rank() == 0:
+            if get_rank() == 0:
                 print(f"\nComputing loss for layer {layer_num}...")
             pruned_loss = self._compute_loss()
             
@@ -480,102 +518,146 @@ def print_importance_scores(importance_scores):
     print("="*50)
 
 def main():
-    # Set environment variable for memory management
+    import argparse
+
+    parser = argparse.ArgumentParser(description="ADEPT parameter/layer importance analysis.")
+    parser.add_argument("--model_name_or_path", required=True)
+    _default_data = str(
+        (Path(__file__).resolve().parents[1] / "shared/data/adept_general_competence.json")
+    )
+    parser.add_argument(
+        "--data_path",
+        default=_default_data,
+        help="JSON list with `text` or instruction/output fields. "
+        "Default: shared/data/adept_general_competence.json (ADEPT paper Appendix B.3).",
+    )
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--max_length", type=int, default=2048)
+    parser.add_argument(
+        "--top_k_expand",
+        type=int,
+        default=4,
+        help="Suggest this many lowest-importance layers to expand "
+        "(paper B.7 main setting: k=4; Llama medical exception used k=8).",
+    )
+    args = parser.parse_args()
+
+    if not Path(args.data_path).is_file():
+        raise FileNotFoundError(
+            f"Importance data not found: {args.data_path}. "
+            "Run: python shared/scripts/prepare_adept_general_competence.py"
+        )
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-    
-    # Initialize distributed environment
+
     local_rank, num_gpus = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
-    
+
     if local_rank == 0:
         print(f"Using {num_gpus} GPUs")
+        print(f"model={args.model_name_or_path}")
+        print(f"data={args.data_path}")
+        print(f"output_dir={args.output_dir}")
 
     if dist.is_initialized():
         dist.barrier()
 
-    # Load model
-    model_name = "path/to/your/model"
+    model_name = args.model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
-        device_map="balanced",
+        device_map={"": local_rank} if num_gpus == 1 else "balanced",
         low_cpu_mem_usage=True,
-        trust_remote_code=True
+        trust_remote_code=True,
     )
 
     if dist.is_initialized():
         dist.barrier()
 
-    # Load data
-    if local_rank == 0:
-        with open('path/to/your/data.json', 'r', encoding='utf-8') as f:
+    if local_rank == 0 or not (dist.is_available() and dist.is_initialized()):
+        with open(args.data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    
-    # Broadcast data to all ranks (simplified; in practice, consider more efficient methods)
-    if dist.is_initialized():
-        data_tensor = None
+
+    if dist.is_available() and dist.is_initialized():
         if local_rank == 0:
             data_str = json.dumps(data)
-            data_bytes = data_str.encode('utf-8')
+            data_bytes = data_str.encode("utf-8")
             data_tensor = torch.ByteTensor(list(data_bytes)).to(device)
             data_size = torch.LongTensor([len(data_bytes)]).to(device)
         else:
             data_size = torch.LongTensor([0]).to(device)
-        
+
         dist.broadcast(data_size, src=0)
         if local_rank != 0:
             data_tensor = torch.ByteTensor([0] * data_size.item()).to(device)
-        
+
         dist.broadcast(data_tensor, src=0)
-        
+
         if local_rank != 0:
             data_bytes = bytes(data_tensor.cpu().tolist())
-            data_str = data_bytes.decode('utf-8')
+            data_str = data_bytes.decode("utf-8")
             data = json.loads(data_str)
 
-    # Create dataset and dataloader
-    dataset = SimpleDataset(data, tokenizer)
-    dataloader, sampler = create_dataloader(dataset, batch_size=4, local_rank=local_rank)
-    
-    # Gradient-based importance analysis
+    dataset = SimpleDataset(data, tokenizer, max_length=args.max_length)
+    dataloader, sampler = create_dataloader(dataset, batch_size=args.batch_size, local_rank=local_rank)
+
     importance = gradient_importance_analysis(model, dataloader, device)
-    
-    # Pruning-based importance analysis
-    pruning_dataloader, _ = create_dataloader(dataset, batch_size=2, local_rank=local_rank)
+
+    pruning_dataloader, _ = create_dataloader(
+        dataset, batch_size=max(1, args.batch_size // 2), local_rank=local_rank
+    )
     pruning_analyzer = PruningImportanceAnalyzer(model, pruning_dataloader, device)
     pruning_importance = pruning_analyzer.compute_importance()
-    
-    # Save and print results on main process
+
     if local_rank == 0:
-        # Gradient-based results
+        param_out = os.path.join(args.output_dir, "param_importance_sorted.json")
+        layer_out = os.path.join(args.output_dir, "layer_importance_sorted.json")
+        prune_png = os.path.join(args.output_dir, "pruning_importance.png")
+        prune_json = os.path.join(args.output_dir, "pruning_importance_analysis.json")
+        expand_out = os.path.join(args.output_dir, "suggested_expand_layers.txt")
+
         print_sorted_importance(importance, top_k=None)
-        save_sorted_importance(importance, 'path/to/your/param_importance_sorted.json')
-        
+        save_sorted_importance(importance, param_out)
+
         layer_results = analyze_layer_importance(importance)
         print_layer_importance(layer_results)
-        save_analysis_results(layer_results, 'path/to/your/layer_importance_sorted.json')
-        
-        # Pruning-based results
+        save_analysis_results(layer_results, layer_out)
+
+        ranked = sorted(layer_results["method1"].items(), key=lambda x: x[1])
+        expand_ids = [int(name.split("_")[1]) for name, _ in ranked[: args.top_k_expand]]
+        expand_ids_sorted = sorted(expand_ids)
+        with open(expand_out, "w", encoding="utf-8") as f:
+            f.write(",".join(str(i) for i in expand_ids_sorted) + "\n")
+        print(f"Suggested expand_layers (lowest general importance, k={args.top_k_expand}): {expand_ids_sorted}")
+        print(f"Wrote {expand_out}")
+
         print_importance_scores(pruning_importance)
-        plot_importance_scores(pruning_importance, 'path/to/your/pruning_importance.png')
-        
-        with open('path/to/your/pruning_importance_analysis.json', 'w') as f:
+        plot_importance_scores(pruning_importance, prune_png)
+
+        with open(prune_json, "w", encoding="utf-8") as f:
             min_val = min(pruning_importance.values())
             max_val = max(pruning_importance.values())
-            json.dump({
-                'raw_scores': pruning_importance,
-                'normalized_scores': {
-                    layer: (score - min_val) / (max_val - min_val)
-                    for layer, score in pruning_importance.items()
-                }
-            }, f, indent=4)
-    
-    # Clean up
+            json.dump(
+                {
+                    "raw_scores": pruning_importance,
+                    "normalized_scores": {
+                        layer: (score - min_val) / (max_val - min_val) if max_val > min_val else 0.0
+                        for layer, score in pruning_importance.items()
+                    },
+                },
+                f,
+                indent=4,
+            )
+
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()

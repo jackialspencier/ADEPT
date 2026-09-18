@@ -95,6 +95,10 @@ def is_transformers_version_greater_than(content: str):
     return _get_package_version("transformers") >= version.parse(content)
 
 
+def is_safetensors_available():
+    return _is_package_available("safetensors")
+
+
 def is_uvicorn_available():
     return _is_package_available("uvicorn")
 

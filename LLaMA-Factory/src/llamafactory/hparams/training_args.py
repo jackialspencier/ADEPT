@@ -81,6 +81,12 @@ class RayArguments:
 class TrainingArguments(RayArguments, Seq2SeqTrainingArguments):
     r"""Arguments pertaining to the trainer."""
 
+    # Kept for YAML/CLI compat: removed from transformers.TrainingArguments in v5+.
+    overwrite_output_dir: bool = field(
+        default=False,
+        metadata={"help": "Overwrite the content of the output directory."},
+    )
+
     def __post_init__(self):
         Seq2SeqTrainingArguments.__post_init__(self)
         RayArguments.__post_init__(self)

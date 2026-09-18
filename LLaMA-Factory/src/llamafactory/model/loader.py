@@ -22,7 +22,6 @@ from transformers import (
     AutoModelForImageTextToText,
     AutoModelForSeq2SeqLM,
     AutoModelForTextToWaveform,
-    AutoModelForVision2Seq,
     AutoProcessor,
     AutoTokenizer,
 )
@@ -158,8 +157,6 @@ def load_model(
         else:
             if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
                 load_class = AutoModelForImageTextToText
-            elif type(config) in AutoModelForVision2Seq._model_mapping.keys():  # image-text
-                load_class = AutoModelForVision2Seq
             elif type(config) in AutoModelForSeq2SeqLM._model_mapping.keys():  # audio-text
                 load_class = AutoModelForSeq2SeqLM
             elif type(config) in AutoModelForTextToWaveform._model_mapping.keys():  # audio hack for qwen omni

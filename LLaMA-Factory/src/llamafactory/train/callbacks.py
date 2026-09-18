@@ -29,13 +29,13 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, has_length
 from transformers.utils import (
     SAFE_WEIGHTS_NAME,
     WEIGHTS_NAME,
-    is_safetensors_available,
 )
 from typing_extensions import override
 
 from ..extras import logging
 from ..extras.constants import TRAINER_LOG, V_HEAD_SAFE_WEIGHTS_NAME, V_HEAD_WEIGHTS_NAME
 from ..extras.misc import get_peak_memory, is_env_enabled, use_ray
+from ..extras.packages import is_safetensors_available
 
 
 if is_safetensors_available():
@@ -395,7 +395,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl
 from typing_extensions import override
 
-from ...extras import logging
+from ..extras import logging
 
 logger = logging.get_logger(__name__)
 

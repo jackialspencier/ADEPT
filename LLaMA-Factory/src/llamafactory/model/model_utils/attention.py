@@ -14,10 +14,10 @@
 
 from typing import TYPE_CHECKING
 
-from transformers.utils import is_flash_attn_2_available, is_torch_sdpa_available
-
+from ...extras import hf_compat as _hf_compat  # noqa: F401
 from ...extras import logging
 from ...extras.constants import AttentionFunction
+from transformers.utils import is_flash_attn_2_available, is_torch_sdpa_available
 
 
 if TYPE_CHECKING:

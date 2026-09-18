@@ -18,37 +18,66 @@ def change_name(name: str, old_index: int, new_index: int) -> str:
     """Replace the layer index in a weight name from old_index to new_index."""
     return name.replace(f".{old_index:d}.", f".{new_index:d}.")
 
+def _parse_expand_layers(expand_layers) -> list[int]:
+    """Parse Fire CLI args: "2,5,8" may arrive as str, or as tuple (2, 5, 8)."""
+    if isinstance(expand_layers, (list, tuple)):
+        return [int(x) for x in expand_layers]
+    if isinstance(expand_layers, int):
+        return [expand_layers]
+    text = str(expand_layers).strip()
+    if not text:
+        raise ValueError("expand_layers is empty")
+    # Strip accidental quotes/parentheses from shell/Fire
+    text = text.strip("()[]\"'")
+    return [int(x.strip()) for x in text.split(",") if x.strip()]
+
+
 def block_expansion(
     model_name_or_path: str,
     output_dir: str,
-    expand_layers: str,  # New parameter, e.g., "2,5,8" to expand layers 2, 5, and 8
+    expand_layers: str,  # e.g. "2,5,8" (Fire may also pass tuple (2,5,8))
     shard_size: str = "5GB",
     save_safetensors: bool = True,
 ):
-    r"""Perform block expansion for LLaMA, Mistral, Qwen2 or Yi models.
+    r"""Perform block expansion for LLaMA, Mistral, Qwen2, Yi, or Gemma models.
 
-    Usage: python expand.py --model_name_or_path meta-llama/Llama-2-7b-hf --output_dir /Your/Path/To/llama2_pro --expand_layers "2,5,8"
+    Usage: python expand.py --model_name_or_path meta-llama/Llama-2-7b-hf --output_dir /Your/Path/To/llama2_pro --expand_layers="2,5,8"
     """
     config: PretrainedConfig = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
     num_layers = getattr(config, "num_hidden_layers")
-    
-    # Parse the layers to be expanded
+
     print("expand_layers:", expand_layers)
-    try:
-        expand_layer_list = [int(x.strip()) for x in expand_layers.split(",")]
-    except Exception:
-        # Handle single integer input
-        expand_layer_list = [int(expand_layers)]
+    expand_layer_list = _parse_expand_layers(expand_layers)
     num_expand = len(expand_layer_list)
-    
+ 
     # Validate that the specified layers are within valid range
     if any(layer >= num_layers or layer < 0 for layer in expand_layer_list):
         raise ValueError(f"Expand layers must be between 0 and {num_layers-1}")
     if len(set(expand_layer_list)) != len(expand_layer_list):
         raise ValueError("Duplicate layers in expand_layers")
     
-    # Update config with new number of layers
+    # Update config with new number of layers.
+    # Gemma2+/transformers>=5 keep a per-layer `layer_types` list that must match
+    # `num_hidden_layers`. Inserted blocks inherit the source layer's attention type.
+    old_layer_types = list(getattr(config, "layer_types", None) or [])
+    if old_layer_types and len(old_layer_types) != num_layers:
+        raise ValueError(
+            f"config.layer_types length ({len(old_layer_types)}) != num_hidden_layers ({num_layers})"
+        )
+    new_layer_types: list[str] = []
+    expand_set_for_types = set(expand_layer_list)
+    for i in range(num_layers):
+        src_type = old_layer_types[i] if old_layer_types else None
+        if src_type is None:
+            # Gemma2 default: odd positions (1-based) sliding, even full
+            src_type = "sliding_attention" if bool((i + 1) % 2) else "full_attention"
+        new_layer_types.append(src_type)
+        if i in expand_set_for_types:
+            new_layer_types.append(src_type)
+
     setattr(config, "num_hidden_layers", num_layers + num_expand)
+    if hasattr(config, "layer_types") or old_layer_types:
+        setattr(config, "layer_types", new_layer_types)
     config.save_pretrained(output_dir)
 
     # Save tokenizer

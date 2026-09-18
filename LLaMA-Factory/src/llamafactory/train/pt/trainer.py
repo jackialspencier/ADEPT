@@ -48,14 +48,25 @@ class CustomTrainer(Trainer):
         if processor is not None:
             self.add_callback(SaveProcessorCallback(processor))
 
-        self.add_callback(ParameterImportanceCallback(
-            eval_steps=500,
-            batch_size=2,
-            eval_data_path="YOU/PATH",
-            tokenizer=self.tokenizer,
-            model=self.model,
-            trainer=self
-        ))
+        # General-domain eval data for dynamic LR (paper Appendix B.3 corpus).
+        # Prefer ADEPT_EVAL_DATA_PATH; else $REPO_ROOT/shared/data/adept_general_competence.json.
+        import os
+        adept_eval = os.environ.get("ADEPT_EVAL_DATA_PATH")
+        if not adept_eval:
+            _root = os.environ.get("REPO_ROOT")
+            if _root:
+                _cand = os.path.join(_root, "shared/data/adept_general_competence.json")
+                if os.path.isfile(_cand):
+                    adept_eval = _cand
+        if adept_eval:
+            self.add_callback(ParameterImportanceCallback(
+                eval_steps=int(os.environ.get("ADEPT_IMPORTANCE_EVAL_STEPS", "500")),
+                batch_size=int(os.environ.get("ADEPT_IMPORTANCE_BATCH_SIZE", "2")),
+                eval_data_path=adept_eval,
+                tokenizer=self.tokenizer,
+                model=self.model,
+                trainer=self,
+            ))
 
         if finetuning_args.use_badam:
             from badam import BAdamCallback, clip_grad_norm_old_version
